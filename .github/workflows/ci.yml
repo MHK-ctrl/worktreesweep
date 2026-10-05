@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show the git version under test
+        run: git --version
+
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Check that the CLI imports the standard library only
+        run: |
+          python3 - <<'PY'
+          import ast
+          import sys
+
+          ALLOWED = {"argparse", "datetime", "json", "os", "subprocess", "sys"}
+          with open("src/worktreesweep.py", encoding="utf-8") as handle:
+              source = handle.read()
+          tree = ast.parse(source)
+
+          found = set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  found.update(alias.name.split(".")[0] for alias in node.names)
+              elif isinstance(node, ast.ImportFrom):
+                  found.add((node.module or "").split(".")[0])
+
+          print("imports found: %s" % sorted(found))
+          unexpected = found - ALLOWED
+          if unexpected:
+              sys.exit("unexpected (non-stdlib) imports: %s" % sorted(unexpected))
+          print("stdlib-only check passed: no third-party runtime dependencies")
+          PY
