@@ -8,16 +8,20 @@ in and labels each one:
 * ``MANUAL REVIEW``     - Git cannot prove the worktree is safe to remove.
 * ``KEEP``              - provably not stale, or the main worktree.
 
-This build is a read-only reporter: it inspects worktrees and explains what it
-found, and it has no code path that can modify the repository.
+The default mode is a read-only report. ``--apply`` removes candidates, but only
+after re-checking each one and asking for a per-worktree confirmation.
 
 Design rules this module must preserve (see docs/ARCHITECTURE.md):
 
 * Standard library only. No third-party runtime dependencies, ever.
 * Every Git invocation is an argument list (``shell=False``); never a shell
   string, never a ``sh -c``.
+* Removal happens only through ``git worktree remove <path>``. Never
+  ``git worktree prune``, never a recursive delete, never ``--force``.
 * The base branch is never guessed: it comes from ``--base`` or from
   ``refs/remotes/origin/HEAD``, and the tool refuses to run without one.
+* Dry run by default. Removal needs ``--apply`` *and* an explicit per-worktree
+  "yes". There is no blanket ``--yes`` and no ``--force`` flag.
 """
 
 import argparse
@@ -230,6 +234,40 @@ def parse_worktree_list(raw):
 
     finish()
     return worktrees
+
+
+def removal_guard(worktree):
+    """Last line of defence. Returns a refusal reason, or None if removal is allowed.
+
+    This is checked immediately before ``git worktree remove``, independently of
+    the verdict that produced the candidate list, so an unknown or unsafe state
+    can never reach the mutating command.
+    """
+    if worktree is None:
+        return "unknown worktree state"
+    if worktree.bare:
+        return "a bare repository has no worktree to remove"
+    if worktree.is_main:
+        return "the main worktree is never removed"
+    if worktree.locked:
+        return "locked worktrees are never removed"
+    if worktree.prunable:
+        return "git reports this worktree as prunable"
+    if worktree.path_is_symlink:
+        return "the path is a symlink; refusing to follow it"
+    if not worktree.path_exists:
+        return "the path does not exist"
+    if worktree.detached:
+        return "HEAD is detached; Git cannot prove what this worktree is for"
+    if worktree.branch_missing:
+        return "the branch ref no longer exists"
+    if not worktree.head_valid:
+        return "HEAD does not point at a commit"
+    if worktree.error:
+        return "git reported an error: %s" % worktree.error
+    if worktree.dirty:
+        return "the worktree has uncommitted or untracked changes"
+    return None
 
 
 class Sweeper:
@@ -447,6 +485,85 @@ class Sweeper:
             )
         return CANDIDATE, "clean, merged into %s, and %s" % (self.base, worktree.age_text())
 
+    # -- the only mutating code path ------------------------------------
+    def _fresh_candidate(self, path):
+        """Re-inspect the repository and return ``(worktree, None)`` if *path* is
+        still a removal candidate, else ``(None, refusal reason)``."""
+        try:
+            worktrees = self.inspect_all()
+        except GitError as exc:
+            return None, "git failed while re-checking: %s" % exc
+        for worktree in worktrees:
+            if path_key(worktree.path) == path_key(path):
+                if worktree.verdict == CANDIDATE:
+                    return worktree, None
+                return None, "it is no longer a removal candidate (%s)" % worktree.reason
+        return None, "git no longer lists this worktree"
+
+    def apply(self, worktrees, out):
+        """Interactively remove candidates. Returns a process exit code."""
+        candidates = [wt for wt in worktrees if wt.verdict == CANDIDATE]
+        if not candidates:
+            out.write("\nNo removal candidates. Nothing was removed.\n")
+            return 0
+
+        removed, skipped, refused = [], [], []
+        for worktree in candidates:
+            out.write("\nRemoval candidate: %s\n" % worktree.path)
+            out.write(
+                "  branch %s | HEAD %s | %s\n"
+                % (worktree.branch_label, short_sha(worktree.head), worktree.age_text())
+            )
+
+            fresh, refusal = self._fresh_candidate(worktree.path)
+            if fresh is None:
+                out.write("  SKIPPED - %s\n" % refusal)
+                skipped.append(worktree.path)
+                continue
+
+            refusal = removal_guard(fresh)
+            if refusal:
+                out.write("  SKIPPED - %s\n" % refusal)
+                skipped.append(worktree.path)
+                continue
+
+            if not self.confirm("  Remove this worktree? [y/N] "):
+                out.write("  SKIPPED - not confirmed. Nothing was removed.\n")
+                skipped.append(worktree.path)
+                continue
+
+            # Re-check one more time, immediately before the mutating command.
+            fresh, refusal = self._fresh_candidate(worktree.path)
+            if fresh is None:
+                out.write("  SKIPPED - %s\n" % refusal)
+                skipped.append(worktree.path)
+                continue
+            refusal = removal_guard(fresh)
+            if refusal:
+                out.write("  SKIPPED - %s\n" % refusal)
+                skipped.append(worktree.path)
+                continue
+
+            proc = self.git(["worktree", "remove", fresh.path], cwd=self.repo_root)
+            if proc.returncode != 0:
+                message = decode(proc.stderr).strip() or "git worktree remove exited %d" % proc.returncode
+                out.write("  REFUSED - git did not remove it: %s\n" % message)
+                refused.append((fresh.path, message))
+                continue
+
+            out.write("  REMOVED - %s\n" % fresh.path)
+            removed.append(fresh.path)
+
+        out.write(
+            "\nApplied: %d removed | %d skipped | %d refused by git\n"
+            % (len(removed), len(skipped), len(refused))
+        )
+        if refused:
+            for path, message in refused:
+                out.write("  git refused %s: %s\n" % (path, message))
+            return 1
+        return 0
+
 
 # -- rendering ----------------------------------------------------------
 def count_verdicts(worktrees, verdict):
@@ -535,7 +652,8 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
-            "Find stale Git worktrees and report what is safe to remove."
+            "Find stale Git worktrees and clean them up - safely. Reports only by"
+            " default; --apply removes candidates after a per-worktree confirmation."
         ),
         epilog=(
             "A worktree is only ever a removal candidate when it is a linked (non-main)"
@@ -564,6 +682,11 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="remove candidates that you confirm one by one (default is a dry run)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -576,6 +699,10 @@ def main(argv=None, git=None, confirm=None, out=None, err=None):
     out = out or sys.stdout
     err = err or sys.stderr
     args = build_parser().parse_args(argv)
+
+    if args.apply and args.as_json:
+        err.write("error: --apply cannot be combined with --json. --json is a dry-run report.\n")
+        return 2
 
     sweeper = Sweeper(base=args.base, older_than_days=args.older_than, git=git, confirm=confirm)
     try:
@@ -599,8 +726,10 @@ def main(argv=None, git=None, confirm=None, out=None, err=None):
         sweeper.repo_root,
         sweeper.base,
         args.older_than,
-        dry_run=True,
+        dry_run=not args.apply,
     )
+    if args.apply:
+        return sweeper.apply(worktrees, out)
     return 0
 
 
